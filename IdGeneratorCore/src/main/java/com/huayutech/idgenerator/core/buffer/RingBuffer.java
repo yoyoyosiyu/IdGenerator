@@ -15,6 +15,7 @@
  */
 package com.huayutech.idgenerator.core.buffer;
 
+import com.huayutech.idgenerator.core.executor.RingBufferPaddingExecutor;
 import com.huayutech.idgenerator.core.utils.PaddedAtomicLong;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -61,6 +62,8 @@ public class RingBuffer {
     /** Executor of padding buffer */
     private RingBufferPaddingExecutor bufferPaddingExecutor;
 
+    private AtomicLong lastId = new AtomicLong(-1L);
+
     /**
      * Constructor with buffer size, paddingFactor default as {@value #DEFAULT_PADDING_PERCENT}
      * 
@@ -97,24 +100,28 @@ public class RingBuffer {
      * We use 'synchronized' to guarantee the UID fill in slot & publish new tail sequence as atomic operations<br>
      * 
      * <b>Note that: </b> It is recommended to put UID in a serialize way, cause we once batch generate a series UIDs and put
-     * the one by one into the com.huayutech.idgenerator.core.buffer, so it is unnecessary put in multi-threads
+     * the one by one into the buffer, so it is unnecessary put in multi-threads
      *
      * @param uid
-     * @return false means that the com.huayutech.idgenerator.core.buffer is full, apply {@link RejectedPutBufferHandler}
+     * @return false means that the buffer is full
      */
     public synchronized boolean put(long uid) {
         long currentTail = tail.get();
         long currentCursor = cursor.get();
 
+        System.out.println(String.format("cursor: %d, tail: %d", currentCursor, currentTail));
+
         // tail catches the cursor, means that you can't put any cause of RingBuffer is full
         long distance = currentTail - (currentCursor == START_POINT ? 0 : currentCursor);
         if (distance == bufferSize - 1) {
+            System.out.println("full");
             return false;
         }
 
         // 1. pre-check whether the flag is CAN_PUT_FLAG
         int nextTailIndex = calSlotIndex(currentTail + 1);
         if (flags[nextTailIndex].get() != CAN_PUT_FLAG) {
+            System.out.println("cant put flag");
             return false;
         }
 
@@ -147,6 +154,7 @@ public class RingBuffer {
 
         // check for safety consideration, it never occurs
         assert nextCursor >= currentCursor : "Cursor can't move back";
+        assert bufferPaddingExecutor != null : "Must provide a buffer padding executor";
 
         // trigger padding in an async-mode if reach the threshold
         long currentTail = tail.get();
@@ -154,7 +162,9 @@ public class RingBuffer {
         if (currentTail - nextCursor < paddingThreshold && bufferPaddingExecutor != null) {
             LOGGER.info("Reach the padding threshold:{}. tail:{}, cursor:{}, rest:{}", paddingThreshold, currentTail,
                     nextCursor, currentTail - nextCursor);
-            bufferPaddingExecutor.padding(this);
+
+            System.out.println(String.format("Reach the padding threshold:%d. tail:%d, cursor:%d, rest:%d", paddingThreshold, currentTail, nextCursor, currentTail - nextCursor));
+            bufferPaddingExecutor.asyncPadding();
         }
 
         // cursor catch the tail, means that there is no more available UID to take
@@ -170,6 +180,8 @@ public class RingBuffer {
         // 3. set next slot flag as CAN_PUT_FLAG.
         long uid = slots[nextCursorIndex];
         flags[nextCursorIndex].set(CAN_PUT_FLAG);
+
+        lastId.set(uid);
 
         // Note that: Step 2,3 can not swap. If we set flag before get value of slot, the producer may overwrite the
         // slot with a new UID, and this may cause the consumer take the UID twice after walk a round the ring
@@ -210,6 +222,8 @@ public class RingBuffer {
     public int getBufferSize() {
         return bufferSize;
     }
+
+    public long getLastId() { return lastId.get(); }
 
     /**
      * Setters
